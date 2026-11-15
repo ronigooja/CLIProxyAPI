@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -21,11 +22,15 @@ import (
 )
 
 type captureClaudeUsagePlugin struct {
+	traceID string
 	records chan usage.Record
 }
 
 func (p *captureClaudeUsagePlugin) HandleUsage(_ context.Context, record usage.Record) {
 	if p == nil || record.Provider != "claude" {
+		return
+	}
+	if p.traceID != "" && record.TraceID != p.traceID {
 		return
 	}
 	select {
@@ -37,6 +42,40 @@ func (p *captureClaudeUsagePlugin) HandleUsage(_ context.Context, record usage.R
 type noopClaudeUsagePlugin struct{}
 
 func (noopClaudeUsagePlugin) HandleUsage(context.Context, usage.Record) {}
+
+func TestCaptureClaudeUsagePlugin_IgnoresUnrelatedRecords(t *testing.T) {
+	traceID := uuid.NewString()
+	plugin := &captureClaudeUsagePlugin{
+		traceID: traceID,
+		records: make(chan usage.Record, 1),
+	}
+	for _, record := range []usage.Record{
+		{Provider: "claude"},
+		{Provider: "claude", TraceID: uuid.NewString()},
+		{Provider: "openai", TraceID: traceID},
+	} {
+		plugin.HandleUsage(context.Background(), record)
+		select {
+		case got := <-plugin.records:
+			t.Fatalf("captured unrelated usage record: %+v", got)
+		default:
+		}
+	}
+
+	plugin.HandleUsage(context.Background(), usage.Record{
+		Provider: "claude",
+		TraceID:  traceID,
+		Detail:   usage.Detail{InputTokens: 100, OutputTokens: 15},
+	})
+	select {
+	case got := <-plugin.records:
+		if got.TraceID != traceID || got.Detail.InputTokens != 100 || got.Detail.OutputTokens != 15 {
+			t.Fatalf("captured usage record = %+v, want matching trace and token counts", got)
+		}
+	default:
+		t.Fatal("matching usage record was not captured")
+	}
+}
 
 func TestClaudeExecutor_ExecuteStream_Translated_ClientDisconnectAfterTerminalEventIsNotFailed(t *testing.T) {
 	const streamData = "event: message_start\n" +
@@ -73,6 +112,7 @@ func TestClaudeExecutor_ExecuteStream_Translated_ClientDisconnectAfterTerminalEv
 
 	pluginName := "test-claude-translated-disconnect"
 	plugin := &captureClaudeUsagePlugin{
+		traceID: uuid.NewString(),
 		records: make(chan usage.Record, 4),
 	}
 	usage.RegisterNamedPlugin(pluginName, plugin)
@@ -89,7 +129,7 @@ func TestClaudeExecutor_ExecuteStream_Translated_ClientDisconnectAfterTerminalEv
 	}
 	payload := []byte(`{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}],"stream":true}`)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(usage.WithTraceID(context.Background(), plugin.traceID), 5*time.Second)
 	defer cancel()
 
 	result, err := exec.ExecuteStream(ctx, auth, cliproxyexecutor.Request{
@@ -169,6 +209,7 @@ func TestClaudeExecutor_ExecuteStream_Passthrough_ClientDisconnectAfterTerminalE
 
 	pluginName := "test-claude-passthrough-disconnect"
 	plugin := &captureClaudeUsagePlugin{
+		traceID: uuid.NewString(),
 		records: make(chan usage.Record, 4),
 	}
 	usage.RegisterNamedPlugin(pluginName, plugin)
@@ -185,7 +226,7 @@ func TestClaudeExecutor_ExecuteStream_Passthrough_ClientDisconnectAfterTerminalE
 	}
 	payload := []byte(`{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}],"stream":true}`)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(usage.WithTraceID(context.Background(), plugin.traceID), 5*time.Second)
 	defer cancel()
 
 	result, err := exec.ExecuteStream(ctx, auth, cliproxyexecutor.Request{
