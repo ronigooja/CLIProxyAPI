@@ -81,7 +81,6 @@ func TestPluginErrorCarriesRetryAfterIntoCooldownAndHTTPHeader(t *testing.T) {
 		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
 	})
 
-	before := time.Now()
 	_, errExec := authMgr.Execute(context.Background(), []string{provider}, coreexecutor.Request{
 		Model:   model,
 		Payload: []byte(`{"model":"test-model-retry-after"}`),
@@ -92,16 +91,21 @@ func TestPluginErrorCarriesRetryAfterIntoCooldownAndHTTPHeader(t *testing.T) {
 	if errExec == nil {
 		t.Fatal("authMgr.Execute returned nil error")
 	}
-	if got := coreauth.SafeResponseHeaders(errExec).Get("Retry-After"); got != "7" {
-		t.Fatalf("SafeResponseHeaders(errExec) Retry-After = %q, want 7", got)
+	// The manager clamps the 7s plugin hint to its 10s minimum cooldown;
+	// the terminal pool annotation advertises that actual recovery deadline.
+	if got := coreauth.SafeResponseHeaders(errExec).Get("Retry-After"); got != "10" {
+		t.Fatalf("SafeResponseHeaders(errExec) Retry-After = %q, want 10", got)
 	}
 	updated, okAuth := authMgr.GetByID(authID)
 	if !okAuth || updated == nil {
 		t.Fatalf("GetByID(%q) missing", authID)
 	}
 	state := updated.ModelStates[model]
-	if state == nil || !state.NextRetryAfter.After(before.Add(5*time.Second)) {
-		t.Fatalf("model NextRetryAfter = %v, want at least %v (7s cooldown)", state, before.Add(7*time.Second))
+	if state == nil {
+		t.Fatal("model state missing")
+	}
+	if want := state.UpdatedAt.Add(10 * time.Second); !state.NextRetryAfter.Equal(want) {
+		t.Fatalf("model NextRetryAfter = %v, want %v (10s minimum cooldown)", state.NextRetryAfter, want)
 	}
 }
 
